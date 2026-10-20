@@ -1,6 +1,7 @@
 #include <cmath>
 #include "DataFormats/ParticleFlowCandidate/interface/PFCandidate.h"
-#include "DataFormats/ParticleFlowReco/interface/PFBlockElementTrack.h"
+#include "DataFormats/ParticleFlowReco/interface/PFBlock.h"
+#include "DataFormats/ParticleFlowReco/interface/PFBlockElement.h"
 #include "FWCore/AbstractServices/interface/ResourceInformation.h"
 #include "FWCore/Framework/interface/Event.h"
 #include "FWCore/Framework/interface/Frameworkfwd.h"
@@ -12,6 +13,7 @@
 #include "RecoParticleFlow/PFProducer/interface/MLPFModel.h"
 
 using namespace cms::Ort;
+using namespace reco::mlpf;
 
 //use this to switch on detailed print statements in MLPF
 //#define MLPF_DEBUG
@@ -31,12 +33,28 @@ private:
   const edm::EDPutTokenT<reco::PFCandidateCollection> pfCandidatesPutToken_;
   const edm::EDGetTokenT<edm::View<reco::GsfElectron>> gsfElectrons_;
   const edm::EDGetTokenT<reco::PFBlockCollection> inputTagBlocks_;
+
+  const bool noRegressionEndcap_;
+  const StringCutObjectSelector<reco::Track> endcapTk_;
+
+  const bool additionalTrackFilterNoHCAL_;
+  const AdditionalTrackFilterParams additionalTrackFilterParams_;
+
+  using ElementMap = std::multimap<double, unsigned>;
 };
 
 MLPFProducer::MLPFProducer(const edm::ParameterSet& cfg, const ONNXRuntime* cache)
     : pfCandidatesPutToken_{produces<reco::PFCandidateCollection>()},
       gsfElectrons_{consumes<edm::View<reco::GsfElectron>>(edm::InputTag("gedGsfElectronsTmp"))},
-      inputTagBlocks_{consumes<reco::PFBlockCollection>(cfg.getParameter<edm::InputTag>("src"))} {}
+      inputTagBlocks_{consumes<reco::PFBlockCollection>(cfg.getParameter<edm::InputTag>("src"))},
+      noRegressionEndcap_(cfg.getParameter<bool>("noRegressionEndcap")),
+      endcapTk_(cfg.getParameter<std::string>("endcapTk")),
+      additionalTrackFilterNoHCAL_(cfg.getParameter<bool>("additionalTrackFilterNoHCAL")),
+      additionalTrackFilterParams_{
+          std::make_unique<StringCutObjectSelector<reco::Track>>(
+              cfg.getParameter<edm::ParameterSet>("AdditionalTrackFilterNoHCALParams")
+                  .getParameter<std::string>("additionalFilterTk")),
+          cfg.getParameter<edm::ParameterSet>("AdditionalTrackFilterNoHCALParams").getParameter<double>("pt_Error")} {}
 
 void MLPFProducer::produce(edm::Event& event, const edm::EventSetup& setup) {
   using namespace reco::mlpf;
@@ -113,67 +131,8 @@ void MLPFProducer::produce(edm::Event& event, const edm::EventSetup& setup) {
   assert(output_p4.size() == tensor_size * NUM_OUTPUT_FEATURES_P4);
 #endif
 
-  std::vector<reco::PFCandidate> pOutputCandidateCollection;
-  for (size_t ielem = 0; ielem < selected_elements.size(); ielem++) {
-    std::vector<float> pred_id_probas(pdgid_encoding.size(), 0.0);
-    const reco::PFBlockElement* elem = selected_elements[ielem];
-
-#ifdef MLPF_DEBUG
-    std::cout << "ielem=" << ielem << " inputs:";
-    for (unsigned int iprop = 0; iprop < NUM_ELEMENT_FEATURES; iprop++) {
-      std::cout << iprop << "=" << inputs[0][ielem * NUM_ELEMENT_FEATURES + iprop] << " ";
-    }
-    std::cout << std::endl;
-#endif
-
-    const auto logit_no_ptcl = output_binary[ielem * 2 + 0];
-    const auto logit_ptcl = output_binary[ielem * 2 + 1];
-#ifdef MLPF_DEBUG
-    std::cout << "binary: " << logit_no_ptcl << " " << logit_ptcl << std::endl;
-#endif
-
-    // Check if the binary classifier of the model predicted a particle
-    int pred_pid = 0;
-    if (logit_ptcl > logit_no_ptcl) {
-      for (unsigned int idx_id = 0; idx_id < pred_id_probas.size(); idx_id++) {
-        auto pred_proba = output_pid[ielem * NUM_OUTPUT_FEATURES_CLS + idx_id];
-#ifdef MLPF_DEBUG
-        std::cout << "pid proba: " << pred_proba << std::endl;
-        assert(!std::isnan(pred_proba));
-#endif
-        pred_id_probas[idx_id] = pred_proba;
-      }
-
-      auto imax = argMax(pred_id_probas);
-
-      //get the most probable class PDGID
-      pred_pid = pdgid_encoding.at(imax);
-#ifdef MLPF_DEBUG
-      std::cout << "pid: " << pred_pid << std::endl;
-#endif
-    }
-
-#ifdef MLPF_DEBUG
-    std::cout << "p4: " << output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + 0] << " "
-              << output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + 1] << " " << output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + 2]
-              << " " << output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + 3] << " "
-              << output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + 4] << std::endl;
-#endif
-
-    //a particle was predicted for this PFElement, otherwise it was a spectator
-    if (pred_pid != 0) {
-      auto cand = makeCandidate(inputs, output_p4, ielem, pred_pid, elem);
-      setCandidateRefs(cand, selected_elements, ielem);
-      pOutputCandidateCollection.push_back(cand);
-
-#ifdef MLPF_DEBUG
-      std::cout << "ielem=" << ielem << " pred: pid=" << cand.pdgId() << " E=" << cand.energy() << " pt=" << cand.pt()
-                << " eta=" << cand.eta() << " phi=" << cand.phi() << " charge=" << cand.charge() << std::endl;
-#endif
-    }
-  }  //loop over PFElements
-
-  event.emplace(pfCandidatesPutToken_, pOutputCandidateCollection);
+  auto candidates = makeCandidates(inputs, output_binary, output_pid, output_p4, blocks, additionalTrackFilterNoHCAL_, additionalTrackFilterParams_, noRegressionEndcap_, endcapTk_, selected_elements);
+  event.emplace(pfCandidatesPutToken_, candidates);
 }
 
 std::unique_ptr<ONNXRuntime> MLPFProducer::initializeGlobalCache(const edm::ParameterSet& params) {
@@ -198,6 +157,18 @@ void MLPFProducer::fillDescriptions(edm::ConfigurationDescriptions& descriptions
   edm::ParameterSetDescription desc;
   desc.add<edm::InputTag>("src", edm::InputTag("particleFlowBlock"));
   desc.add<edm::FileInPath>("model_path", edm::FileInPath("RecoParticleFlow/PFProducer/data/mlpf/model.onnx"));
+  //
+  desc.add<bool>("additionalTrackFilterNoHCAL", false)
+      ->setComment("Apply tight requirments for tracks not linked to HCAL clusters.");
+  {
+    edm::ParameterSetDescription psd;
+    psd.add<std::string>("additionalFilterTk", "1.48 < abs(eta) < 3.0");
+    psd.add<double>("pt_Error", 1.0)->setComment("Absolute pt error to detect fake tracks.");
+    desc.add<edm::ParameterSetDescription>("AdditionalTrackFilterNoHCALParams", psd);
+  }
+  //
+  desc.add<bool>("noRegressionEndcap", false)->setComment("Turn on/off regression for tracks in the endcap.");
+  desc.add<std::string>("endcapTk", "1.48 < abs(eta) < 3.0");
   descriptions.addWithDefaultLabel(desc);
 }
 

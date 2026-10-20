@@ -1,6 +1,7 @@
 #include "RecoParticleFlow/PFProducer/interface/MLPFModel.h"
 #include "FWCore/MessageLogger/interface/MessageLogger.h"
 #include "FWCore/Utilities/interface/isFinite.h"
+#include "FWCore/Utilities/interface/Exception.h"
 #include "DataFormats/ParticleFlowReco/interface/PFCluster.h"
 #include "DataFormats/ParticleFlowReco/interface/PFBlock.h"
 #include "DataFormats/ParticleFlowReco/interface/PFBlockElementSuperCluster.h"
@@ -10,6 +11,7 @@
 #include "DataFormats/ParticleFlowReco/interface/PFBlockElementCluster.h"
 #include "DataFormats/EgammaReco/interface/SuperCluster.h"
 #include "DataFormats/EgammaReco/interface/ElectronSeed.h"
+#include "RecoParticleFlow/PFProducer/interface/PFMuonAlgo.h"
 #include <TMath.h>
 
 namespace reco::mlpf {
@@ -234,6 +236,25 @@ namespace reco::mlpf {
         time = ref->time();
         timeerror = ref->timeError();
 
+        // Protection against the un-physical cluster time value from
+        // RecoParticleFlow/PFSimProducer/plugins/EcalBarrelClusterFastTimer.cc
+        // in Phase2 workflows
+        if (type == reco::PFBlockElement::ECAL) {
+          if (fabs(time) > std::numeric_limits<float>::max() * 0.9) {  // i.e. when time is set to some non-sense value
+            const std::vector<reco::PFRecHitFraction>& PFRecHits = ref->recHitFractions();
+            double maxE = 0.;
+            for (std::vector<reco::PFRecHitFraction>::const_iterator it = PFRecHits.begin(); it != PFRecHits.end();
+                 ++it) {
+              const PFRecHitRef& RefPFRecHit = it->recHitRef();
+              double energyHit = RefPFRecHit->energy() * it->fraction();
+              if (energyHit > maxE) {
+                maxE = energyHit;
+                time = RefPFRecHit->time();  // set cluster time based on the max energy hit
+              }
+            }
+          }
+        }
+
         std::vector<double> hitE(ref->recHitFractions().size(), 0.0);
         std::vector<double> posEta(ref->recHitFractions().size(), 0.0);
         std::vector<double> posPhi(ref->recHitFractions().size(), 0.0);
@@ -407,6 +428,21 @@ namespace reco::mlpf {
     return static_cast<int>(std::distance(vec.begin(), max_element(vec.begin(), vec.end())));
   }
 
+  bool passAdditionalTrackFilterNoHCAL(const reco::PFBlockElement* elem, const AdditionalTrackFilterParams &params, const TrackToCaloLinks& links) {
+    // Mimic tight track selection in PFAlgo::recoTracksNotHCAL
+    const auto& trackRef = elem->trackRef();
+
+    if (trackRef.isNull())
+      throw cms::Exception("MLPFProducer") << "trackRef not found in passAdditionalTrackFilterNoHCAL.";
+
+    if ((*params.additionalFilterTk)(*trackRef) && links.noHadLink()) {
+      if (!PFMuonAlgo::isMuon(*elem) && trackRef->ptError() > params.ptError)
+        return false;
+    }  // additionalFilterTk && Not linked to Hcal
+
+    return true;
+  }
+
   reco::PFCandidate makeCandidate(int pred_pid,
                                   int pred_charge,
                                   float pred_pt,
@@ -452,79 +488,182 @@ namespace reco::mlpf {
   }
 
   template <typename T>
-  reco::PFCandidate makeCandidate(const std::vector<std::vector<float>>& inputs,
-                                  const T& output_p4,
-                                  const size_t elem_idx,
-                                  int pred_pid,
-                                  const reco::PFBlockElement* elem) {
-    //muons and charged hadrons should only come from tracks, otherwise we won't have track references to pass downstream
-    if (((pred_pid == 13) || (pred_pid == 211)) && elem->type() != reco::PFBlockElement::TRACK) {
-      pred_pid = 130;
-    }
+  std::vector<reco::PFCandidate> makeCandidates(const std::vector<std::vector<float>>& inputs,
+                                                const T& output_binary,
+                                                const T& output_pid,
+                                                const T& output_p4,
+                                                const reco::PFBlockCollection& blocks,
+                                                const bool additionalTrackFilterNoHCAL,
+                                                const AdditionalTrackFilterParams& additionalTrackFilterParams,
+                                                const bool noRegressionEndcap,
+                                                const StringCutObjectSelector<reco::Track>& endcapTk,
+                                                const std::vector<const reco::PFBlockElement*> selected_elements) {
+    std::vector<reco::PFCandidate> pOutputCandidateCollection;
+    for (size_t ielem = 0; ielem < selected_elements.size(); ielem++) {
+      std::vector<float> pred_id_probas(pdgid_encoding.size(), 0.0);
+      const reco::PFBlockElement* elem = selected_elements[ielem];
 
-    float pred_charge = 0.0;
-    if (elem->type() == reco::PFBlockElement::TRACK) {
-      const auto* eltTrack = dynamic_cast<const reco::PFBlockElementTrack*>(elem);
-      //for now, just take the charge from the track
-      if (eltTrack->trackRef().isNonnull()) {
-        pred_charge = eltTrack->trackRef()->charge();
+#ifdef MLPF_DEBUG
+      std::cout << "ielem=" << ielem << " inputs:";
+      for (unsigned int iprop = 0; iprop < NUM_ELEMENT_FEATURES; iprop++) {
+        std::cout << iprop << "=" << inputs[0][ielem * NUM_ELEMENT_FEATURES + iprop] << " ";
+      }
+      std::cout << std::endl;
+#endif
+
+      const auto logit_no_ptcl = output_binary[ielem * 2 + 0];
+      const auto logit_ptcl = output_binary[ielem * 2 + 1];
+#ifdef MLPF_DEBUG
+      std::cout << "binary: " << logit_no_ptcl << " " << logit_ptcl << std::endl;
+#endif
+
+      // Check if the binary classifier of the model predicted a particle
+      int pred_pid = 0;
+      if (logit_ptcl > logit_no_ptcl) {
+        for (unsigned int idx_id = 0; idx_id < pred_id_probas.size(); idx_id++) {
+          auto pred_proba = output_pid[ielem * NUM_OUTPUT_FEATURES_CLS + idx_id];
+#ifdef MLPF_DEBUG
+          std::cout << "pid proba: " << pred_proba << std::endl;
+          assert(!std::isnan(pred_proba));
+#endif
+          pred_id_probas[idx_id] = pred_proba;
+        }
+
+        auto imax = argMax(pred_id_probas);
+
+        //get the most probable class PDGID
+        pred_pid = pdgid_encoding.at(imax);
+#ifdef MLPF_DEBUG
+        std::cout << "pid: " << pred_pid << std::endl;
+#endif
       }
 
-      //a track with no muon ref should not produce a muon candidate, instead we interpret it as a charged hadron here
-      if (pred_pid == 13 && eltTrack->muonRef().isNull()) {
-        pred_pid = 211;
+#ifdef MLPF_DEBUG
+      std::cout << "p4: " << output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + 0] << " "
+                << output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + 1] << " " << output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + 2]
+                << " " << output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + 3] << " "
+                << output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + 4] << std::endl;
+#endif
+
+      //a particle was predicted for this PFElement, otherwise it was a spectator
+      if (pred_pid != 0) {
+        //muons and charged hadrons should only come from tracks, otherwise we won't have track references to pass downstream
+        if (((pred_pid == 13) || (pred_pid == 211)) && elem->type() != reco::PFBlockElement::TRACK) {
+          pred_pid = 130;
+        }
+
+        //consider electron candidates only from GSF track or general track. If not, label them as photons.
+        if ((pred_pid == 11) && elem->type() != reco::PFBlockElement::GSF &&
+            elem->type() != reco::PFBlockElement::TRACK) {
+          pred_pid = 22;
+        }
+
+        float pred_charge = 0.0;
+        if (elem->type() == reco::PFBlockElement::TRACK) {
+          const auto* eltTrack = dynamic_cast<const reco::PFBlockElementTrack*>(elem);
+          //for now, just take the charge from the track
+          if (eltTrack->trackRef().isNonnull()) {
+            pred_charge = eltTrack->trackRef()->charge();
+          }
+
+          //a track with no muon ref should not produce a muon candidate, instead we interpret it as a charged hadron here
+          if (pred_pid == 13 && eltTrack->muonRef().isNull()) {
+            pred_pid = 211;
+          }
+
+          //taus are reconstructed downstream based on other criteria, instead we interpret it as a charged hadron here
+          if (pred_pid == 15) {
+            pred_pid = 211;
+          }
+
+          //tracks from displaced vertices need reference debugging downstream as well, so we just treat them as neutrals for the moment
+          if ((pred_pid == 211) && (eltTrack->isLinkedToDisplacedVertex())) {
+            pred_pid = 130;
+          }
+        }
+
+        //do not attempt to do PID in the HF
+        if (elem->type() == reco::PFBlockElement::HFEM) {
+          pred_pid = 2;
+        } else if (elem->type() == reco::PFBlockElement::HFHAD) {
+          pred_pid = 1;
+        }
+
+        //get the predicted momentum components from the model
+        float pred_pt = output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + IDX_PT];
+        pred_pt = exp(pred_pt) * inputs[0][ielem * NUM_ELEMENT_FEATURES + 1];
+        float pred_eta = output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + IDX_ETA];
+        float pred_sin_phi = output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + IDX_SIN_PHI];
+        float pred_cos_phi = output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + IDX_COS_PHI];
+        float pred_e = output_p4[ielem * NUM_OUTPUT_FEATURES_P4 + IDX_ENERGY];
+        pred_e = exp(pred_e) * inputs[0][ielem * NUM_ELEMENT_FEATURES + 5];
+
+        if (elem->type() == reco::PFBlockElement::TRACK) {
+          const auto* eltTrack = dynamic_cast<const reco::PFBlockElementTrack*>(elem);
+          const auto trackRef = eltTrack->trackRef();
+          if (trackRef.isNonnull()) {
+            pred_eta = trackRef->eta();
+            pred_sin_phi = sin(trackRef->phi());
+            pred_cos_phi = cos(trackRef->phi());
+
+            // Prepare for extra checks for a track
+            const reco::PFBlock* correspondingBlock = findBlock(blocks, elem);
+            const auto trackLinks = getTrackToCaloLinks(correspondingBlock, elem);
+
+            // Mimic tight track selection in PFAlgo::recoTracksNotHCAL
+            if (additionalTrackFilterNoHCAL && !passAdditionalTrackFilterNoHCAL(elem, additionalTrackFilterParams, trackLinks))
+              continue;
+
+#ifdef   MLPF_DEBUG
+            std::cout << ielem << " " << trackLinks.ecal << " " << trackLinks.hcal << " " << trackLinks.hfEm << " "
+                      << trackLinks.hfHad << " " << trackRef->pt() << " " << trackRef->ptError() << " " << trackRef->eta()
+                      << " " << std::endl;
+#endif
+
+            if (noRegressionEndcap && endcapTk(*trackRef) && trackLinks.noCaloLink()) {
+              // take track kinematics if a track is in the HGCAL eta coverage and no link to ECAL, HCAL, and HF clusters.
+              pred_pt = trackRef->pt();
+              pred_e = std::sqrt(trackRef->p() * trackRef->p() + PI_MASS * PI_MASS);
+            }
+
+          }  // trackRef present
+        }  // track element
+
+        auto cand = makeCandidate(pred_pid, pred_charge, pred_pt, pred_eta, pred_sin_phi, pred_cos_phi, pred_e);
+        setCandidateRefs(cand, selected_elements, ielem);
+        pOutputCandidateCollection.push_back(cand);
+
+#ifdef MLPF_DEBUG
+      std::cout << "ielem=" << ielem << " pred: pid=" << cand.pdgId() << " E=" << cand.energy() << " pt=" << cand.pt()
+                << " eta=" << cand.eta() << " phi=" << cand.phi() << " charge=" << cand.charge() << std::endl;
+#endif
       }
+    }  //loop over PFElements
 
-      //taus are reconstructed downstream based on other criteria, instead we interpret it as a charged hadron here
-      if (pred_pid == 15) {
-        pred_pid = 211;
-      }
-
-      //tracks from displaced vertices need reference debugging downstream as well, so we just treat them as neutrals for the moment
-      if ((pred_pid == 211) && (eltTrack->isLinkedToDisplacedVertex())) {
-        pred_pid = 130;
-      }
-    }
-
-    //do not attempt to do PID in the HF
-    if (elem->type() == reco::PFBlockElement::HFEM) {
-      pred_pid = 2;
-    } else if (elem->type() == reco::PFBlockElement::HFHAD) {
-      pred_pid = 1;
-    }
-
-    //get the predicted momentum components from the model
-    float pred_pt = output_p4[elem_idx * NUM_OUTPUT_FEATURES_P4 + IDX_PT];
-    pred_pt = exp(pred_pt) * inputs[0][elem_idx * NUM_ELEMENT_FEATURES + 1];
-    float pred_eta = output_p4[elem_idx * NUM_OUTPUT_FEATURES_P4 + IDX_ETA];
-    float pred_sin_phi = output_p4[elem_idx * NUM_OUTPUT_FEATURES_P4 + IDX_SIN_PHI];
-    float pred_cos_phi = output_p4[elem_idx * NUM_OUTPUT_FEATURES_P4 + IDX_COS_PHI];
-    float pred_e = output_p4[elem_idx * NUM_OUTPUT_FEATURES_P4 + IDX_ENERGY];
-    pred_e = exp(pred_e) * inputs[0][elem_idx * NUM_ELEMENT_FEATURES + 5];
-
-    if (elem->type() == reco::PFBlockElement::TRACK) {
-      const auto* eltTrack = dynamic_cast<const reco::PFBlockElementTrack*>(elem);
-      if (eltTrack->trackRef().isNonnull()) {
-        pred_eta = eltTrack->trackRef()->eta();
-        pred_sin_phi = sin(eltTrack->trackRef()->phi());
-        pred_cos_phi = cos(eltTrack->trackRef()->phi());
-      }
-    }
-
-    return makeCandidate(pred_pid, pred_charge, pred_pt, pred_eta, pred_sin_phi, pred_cos_phi, pred_e);
+    return pOutputCandidateCollection;
   }
 
-  template reco::PFCandidate makeCandidate(const std::vector<std::vector<float>>& inputs,
-                                           const std::vector<float>& output_p4,
-                                           const size_t elem_idx,
-                                           int pred_pid,
-                                           const reco::PFBlockElement* elem);
+  template std::vector<reco::PFCandidate> makeCandidates(const std::vector<std::vector<float>>& inputs,
+                                                         const std::vector<float>& output_binary,
+                                                         const std::vector<float>& output_pid,
+                                                         const std::vector<float>& output_p4,
+                                                         const reco::PFBlockCollection& blocks,
+                                                         const bool additionalTrackFilterNoHCAL,
+                                                         const AdditionalTrackFilterParams& additionalTrackFilterParams,
+                                                         const bool noRegressionEndcap,
+                                                         const StringCutObjectSelector<reco::Track>& endcapTk,
+                                                         const std::vector<const reco::PFBlockElement*> selected_elements);
 
-  template reco::PFCandidate makeCandidate(const std::vector<std::vector<float>>& inputs,
-                                           const std::span<const float>& output_p4,
-                                           const size_t elem_idx,
-                                           int pred_pid,
-                                           const reco::PFBlockElement* elem);
+  template std::vector<reco::PFCandidate> makeCandidates(const std::vector<std::vector<float>>& inputs,
+                                                         const std::span<const float>& output_binary,
+                                                         const std::span<const float>& output_pid,
+                                                         const std::span<const float>& output_p4,
+                                                         const reco::PFBlockCollection& blocks,
+                                                         const bool additionalTrackFilterNoHCAL,
+                                                         const AdditionalTrackFilterParams& additionalTrackFilterParams,
+                                                         const bool noRegressionEndcap,
+                                                         const StringCutObjectSelector<reco::Track>& endcapTk,
+                                                         const std::vector<const reco::PFBlockElement*> selected_elements);
 
   const std::vector<const reco::PFBlockElement*> getPFElements(const reco::PFBlockCollection& blocks) {
     std::vector<reco::PFCandidate> pOutputCandidateCollection;
@@ -555,7 +694,7 @@ namespace reco::mlpf {
     }
 
     //set the muon ref
-    if (std::abs(cand.pdgId()) == 13) {
+    else if (std::abs(cand.pdgId()) == 13) {
       const auto* eltTrack = dynamic_cast<const reco::PFBlockElementTrack*>(elem);
       const auto& muonRef = eltTrack->muonRef();
       cand.setTrackRef(muonRef->track());
@@ -564,14 +703,40 @@ namespace reco::mlpf {
       cand.setMuonRef(muonRef);
     }
 
-    if (std::abs(cand.pdgId()) == 11) {
+    else if (std::abs(cand.pdgId()) == 11) {
       if (elem->type() == reco::PFBlockElement::GSF) {
         const auto* eltTrack = dynamic_cast<const reco::PFBlockElementGsfTrack*>(elem);
         const auto& ref = eltTrack->GsftrackRef();
         cand.setGsfTrackRef(ref);
         cand.setVertex(ref->vertex());
+      } else if (elem->type() == reco::PFBlockElement::TRACK && elem->trackRef().isNonnull()) {
+        const auto* eltTrack = dynamic_cast<const reco::PFBlockElementTrack*>(elem);
+        cand.setTrackRef(eltTrack->trackRef());
+        cand.setVertex(eltTrack->trackRef()->vertex());
+        cand.setPositionAtECALEntrance(eltTrack->positionAtECALEntrance());
       }
     }
+  }
+
+  TrackToCaloLinks getTrackToCaloLinks(const reco::PFBlock* block, const reco::PFBlockElement* elem) {
+    TrackToCaloLinks links;
+    const auto& linkData = block->linkData();
+    const auto& elements = block->elements();
+
+    const auto it = std::find_if(elements.begin(), elements.end(), [elem](const auto& e) { return &e == elem; });
+
+    if (it == elements.end())
+      throw cms::Exception("MLPFModel") << "PFBlockElement not found in this PFBlock.";
+
+    const unsigned ielem = std::distance(elements.begin(), it);
+
+    links.ecal = block->hasAssociatedElement(ielem, linkData, reco::PFBlockElement::ECAL, reco::PFBlock::LINKTEST_ALL);
+    links.hcal = block->hasAssociatedElement(ielem, linkData, reco::PFBlockElement::HCAL, reco::PFBlock::LINKTEST_ALL);
+    links.hfEm = block->hasAssociatedElement(ielem, linkData, reco::PFBlockElement::HFEM, reco::PFBlock::LINKTEST_ALL);
+    links.hfHad =
+        block->hasAssociatedElement(ielem, linkData, reco::PFBlockElement::HFHAD, reco::PFBlock::LINKTEST_ALL);
+
+    return links;
   }
 
 };  // namespace reco::mlpf

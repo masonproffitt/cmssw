@@ -1,16 +1,18 @@
+#include "CommonTools/Utils/interface/StringCutObjectSelector.h"
+
+#include "DataFormats/ParticleFlowCandidate/interface/PFCandidate.h"
+#include "DataFormats/ParticleFlowReco/interface/PFBlockElementTrack.h"
+
 #include "FWCore/Framework/interface/Frameworkfwd.h"
 #include "FWCore/Framework/interface/Event.h"
 #include "FWCore/Framework/interface/MakerMacros.h"
 #include "FWCore/ParameterSet/interface/ParameterSet.h"
 #include "FWCore/Utilities/interface/StreamID.h"
 
-#include "DataFormats/ParticleFlowCandidate/interface/PFCandidate.h"
-#include "RecoParticleFlow/PFProducer/interface/MLPFModel.h"
-
-#include "DataFormats/ParticleFlowReco/interface/PFBlockElementTrack.h"
-
 #include "HeterogeneousCore/SonicTriton/interface/TritonEDProducer.h"
 #include "HeterogeneousCore/SonicTriton/interface/TritonData.h"
+
+#include "RecoParticleFlow/PFProducer/interface/MLPFModel.h"
 
 class MLPFSONICProducer : public TritonEDProducer<> {
 public:
@@ -26,6 +28,13 @@ private:
   const edm::EDPutTokenT<reco::PFCandidateCollection> pfCandidatesPutToken_;
   const edm::EDGetTokenT<edm::View<reco::GsfElectron>> gsfElectrons_;
   const edm::EDGetTokenT<reco::PFBlockCollection> inputTagBlocks_;
+
+  const bool noRegressionEndcap_;
+  const StringCutObjectSelector<reco::Track> endcapTk_;
+
+  const bool additionalTrackFilterNoHCAL_;
+  const reco::mlpf::AdditionalTrackFilterParams additionalTrackFilterParams_;
+
   std::vector<const reco::PFBlockElement *> selected_elements_;
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;
@@ -37,8 +46,17 @@ MLPFSONICProducer::MLPFSONICProducer(const edm::ParameterSet &iConfig)
       pfCandidatesPutToken_{produces<reco::PFCandidateCollection>()},
       gsfElectrons_{consumes<edm::View<reco::GsfElectron>>(edm::InputTag("gedGsfElectronsTmp"))},
       inputTagBlocks_{consumes<reco::PFBlockCollection>(iConfig.getParameter<edm::InputTag>("src"))},
+      noRegressionEndcap_(iConfig.getParameter<bool>("noRegressionEndcap")),
+      endcapTk_(iConfig.getParameter<std::string>("endcapTk")),
+      additionalTrackFilterNoHCAL_(iConfig.getParameter<bool>("additionalTrackFilterNoHCAL")),
+      additionalTrackFilterParams_{
+          std::make_unique<StringCutObjectSelector<reco::Track>>(
+              iConfig.getParameter<edm::ParameterSet>("AdditionalTrackFilterNoHCALParams")
+                  .getParameter<std::string>("additionalFilterTk")),
+          iConfig.getParameter<edm::ParameterSet>("AdditionalTrackFilterNoHCALParams").getParameter<double>("pt_Error")},
       input_names_(iConfig.getParameter<std::vector<std::string>>("input_names")),
       output_names_(iConfig.getParameter<std::vector<std::string>>("output_names")) {}
+
 
 MLPFSONICProducer::~MLPFSONICProducer() {}
 void MLPFSONICProducer::acquire(edm::Event const &iEvent, edm::EventSetup const &iSetup, Input &iInput) {
@@ -101,6 +119,7 @@ void MLPFSONICProducer::acquire(edm::Event const &iEvent, edm::EventSetup const 
 }
 void MLPFSONICProducer::produce(edm::Event &iEvent, const edm::EventSetup &iSetup, Output const &iOutput) {
   using namespace reco::mlpf;
+  const auto &blocks = iEvent.get(inputTagBlocks_);
   const auto &bid_name = output_names_[0];
   const auto &id_name = output_names_[1];
   const auto &momentum_name = output_names_[2];
@@ -110,39 +129,24 @@ void MLPFSONICProducer::produce(edm::Event &iEvent, const edm::EventSetup &iSetu
   const auto &output_binary = output1.fromServer<float>();
   const auto &output_pid = output2.fromServer<float>();
   const auto &output_p4 = output3.fromServer<float>();
-  std::vector<reco::PFCandidate> pOutputCandidateCollection;
-  for (size_t ielem = 0; ielem < selected_elements_.size(); ielem++) {
-    std::vector<float> pred_id_probas(pdgid_encoding.size(), 0.0);
-    const reco::PFBlockElement *elem = selected_elements_[ielem];
-    const auto logit_no_ptcl = output_binary[0][ielem * 2 + 0];
-    const auto logit_ptcl = output_binary[0][ielem * 2 + 1];
-
-    // Check if the binary classifier of the model predicted a particle
-    int pred_pid = 0;
-    if (logit_ptcl > logit_no_ptcl) {
-      for (unsigned int idx_id = 0; idx_id < pred_id_probas.size(); idx_id++) {
-        auto pred_proba = output_pid[0][ielem * NUM_OUTPUT_FEATURES_CLS + idx_id];
-        pred_id_probas[idx_id] = pred_proba;
-      }
-
-      auto imax = argMax(pred_id_probas);
-      //get the most probable class PDGID
-      pred_pid = pdgid_encoding.at(imax);
-    }
-    //a particle was predicted for this PFElement, otherwise it was a spectator
-    if (pred_pid != 0) {
-      auto cand = makeCandidate(inputs, output_p4[0], ielem, pred_pid, elem);
-      setCandidateRefs(cand, selected_elements_, ielem);
-      pOutputCandidateCollection.push_back(cand);
-    }
-  }  //end loop of elements
-  iEvent.emplace(pfCandidatesPutToken_, pOutputCandidateCollection);
+  auto candidates = makeCandidates(inputs, output_binary[0], output_pid[0], output_p4[0], blocks, additionalTrackFilterNoHCAL_, additionalTrackFilterParams_, noRegressionEndcap_, endcapTk_, selected_elements_);
+  iEvent.emplace(pfCandidatesPutToken_, candidates);
 }
 
 void MLPFSONICProducer::fillDescriptions(edm::ConfigurationDescriptions &descriptions) {
   edm::ParameterSetDescription desc;
   TritonClient::fillPSetDescription(desc);
   desc.add<edm::InputTag>("src", edm::InputTag("particleFlowBlock"));
+  desc.add<bool>("additionalTrackFilterNoHCAL", false)
+      ->setComment("Apply tight requirments for tracks not linked to HCAL clusters.");
+  {
+    edm::ParameterSetDescription psd;
+    psd.add<std::string>("additionalFilterTk", "1.48 < abs(eta) < 3.0");
+    psd.add<double>("pt_Error", 1.0)->setComment("Absolute pt error to detect fake tracks.");
+    desc.add<edm::ParameterSetDescription>("AdditionalTrackFilterNoHCALParams", psd);
+  }
+  desc.add<bool>("noRegressionEndcap", false)->setComment("Turn on/off regression for tracks in the endcap.");
+  desc.add<std::string>("endcapTk", "1.48 < abs(eta) < 3.0");
   desc.add<std::vector<std::string>>("input_names", {"mask", "Xfeat_normed"});
   desc.add<std::vector<std::string>>("output_names", {"bid", "id", "momentum"});
   descriptions.addWithDefaultLabel(desc);

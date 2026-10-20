@@ -199,9 +199,13 @@ class UpgradeWorkflow(object):
         if self.offset==0 or workflows[num][1]!=stepList:
             workflows[num+self.offset] = [ fragmentTmp, stepList ]
             
+    # True when condition() inspects or amends stepList, so that the caller has to
+    # build the step list before asking
+    conditionUsesStepList = False
+
     def condition(self, fragment, stepList, key, hasHarvest):
         return False
-    
+
     def preventReuse(self, stepName, stepDict, k):
         if "Sim" in stepName and stepName != "Sim":
             stepDict[stepName][k] = None
@@ -313,6 +317,7 @@ class UpgradeWorkflow_DigiNoHLT(UpgradeWorkflow):
                 stepDict[stepName][k] = merge([{'--filein': 'file:step3.root', '--secondfilein': 'file:step2.root'}, stepDict[step][k]])
             if 'Digi' in step and 'NoHLT' not in step:
                 stepDict[stepName][k] = merge([{'-s': re.sub(',HLT.*', '', stepDict[step][k]['-s'])}, stepDict[step][k]])
+    conditionUsesStepList = True
     def condition(self, fragment, stepList, key, hasHarvest):
         if ('TTbar_14TeV' in fragment and '2022' == key):
             stepList.insert(stepList.index('Digi_DigiNoHLT_2022')+1, 'HLTRun3_2022')
@@ -893,7 +898,7 @@ upgradeWFs['enableTICLdumper'] = UpgradeWorkflow_TICLdumper(
     suffix = '_enableTICLdumper',
     offset = 0.206,
 )
-upgradeWFs['enableTICLdumper'].step3 = {'--customise': 'RecoHGCal/TICL/customiseTICLFromReco.customiseTICLForDumper'}
+upgradeWFs['enableTICLdumper'].step3 = {'--customise': 'Validation/TICLValidation/customiseTICLForDumper.customiseTICLForDumper'}
 
 
 class UpgradeWorkflow_CPfromPU(UpgradeWorkflow):
@@ -1131,7 +1136,10 @@ class UpgradeWorkflow_mlpf(UpgradeWorkflow):
         if 'Reco' in step:
             stepDict[stepName][k] = merge([self.step3, stepDict[step][k]])
     def condition(self, fragment, stepList, key, hasHarvest):
-        return (fragment=="TTbar_14TeV" or fragment=="QCD_FlatPt_15_3000HS_14") and '2025PU' in key
+        return (
+            (fragment == "TTbar_14TeV" or fragment == "QCD_FlatPt_15_3000HS_14")
+            and ("Run4" in key or "2025" in key or "2026" in key)
+        )
 
 upgradeWFs['mlpf'] = UpgradeWorkflow_mlpf(
     steps = [
@@ -1139,12 +1147,14 @@ upgradeWFs['mlpf'] = UpgradeWorkflow_mlpf(
         'RecoFakeHLT',
         'RecoNano',
         'RecoNanoFakeHLT',
+        'RecoGlobal'
     ],
     PU = [
         'Reco',
         'RecoFakeHLT',
         'RecoNano',
         'RecoNanoFakeHLT',
+        'RecoGlobal'
     ],
     suffix = '_mlpf',
     offset = 0.13,
@@ -1301,15 +1311,16 @@ class PatatrackWorkflow(UpgradeWorkflow):
         self.__mini = mini
         self.__harvest = harvest
 
+    years = run3_years + ['Run4']
+    fragments = ["TTbar_14","ZMM_14","ZEE_14","ZTT_14","NuGun","SingleMu","QCD_Pt15To7000_Flat"]
+
     def condition(self, fragment, stepList, key, hasHarvest):
         # select only a subset of the workflows
-        years = run3_years + ['Run4']
-        fragments = ["TTbar_14","ZMM_14","ZEE_14","ZTT_14","NuGun","SingleMu","QCD_Pt15To7000_Flat"]
-        selected = [
-            (any(y in key for y in years) and ('FS' not in key) and any( f in fragment for f in fragments)),
+        selected = (
+            (any(y in key for y in self.years) and ('FS' not in key) and any( f in fragment for f in self.fragments)) or
             (('HI' in key) and ('Hydjet' in fragment) and ("PixelOnly" in self.suffix) )
-        ]
-        result = any(selected) and hasHarvest
+        )
+        result = selected and hasHarvest
 
         return result
 
@@ -1385,6 +1396,29 @@ upgradeWFs['HCALOnlyCPU'] = PatatrackWorkflow(
     },
     suffix = 'HCALOnlyCPU',
     offset = 0.521,
+)
+
+# HGCal-only local reconstruction and validation, without general tracking
+#  - Phase-2 only (HGCal does not exist in Run3)
+#  - RAW2DIGI + HGCal-only reconstruction, with DQM and validation
+#  - harvesting
+class UpgradeWorkflow_HGCalOnly(PatatrackWorkflow):
+    def condition(self, fragment, stepList, key, hasHarvest):
+        return ('Run4' in key) and (fragment == "TTbar_14TeV") and hasHarvest
+
+upgradeWFs['HGCalOnly'] = UpgradeWorkflow_HGCalOnly(
+    digi = {
+        # nothing special needed for the HGCal-only reconstruction
+    },
+    reco = {
+        '-s': 'RAW2DIGI:RawToDigi,RECO:reconstruction_hgcalOnly,VALIDATION:@HGCalOnlyValidation',
+        '--customise': 'Validation/Configuration/customiseHGCalOnly.customiseHGCalOnly',
+    },
+    harvest = {
+        '-s': 'HARVESTING:@HGCalOnlyValidation'
+    },
+    suffix = 'HGCalOnly',
+    offset = 0.531,
 )
 
 ###############################################################################################################
@@ -3597,6 +3631,27 @@ upgradeWFs['DDDDB'] = UpgradeWorkflow_DDDDB(
     offset = 0.914,
 )
 upgradeWFs['DDDDB'].allowReuse = False
+
+# SIM from a GenHDF5 file holding the baseline's own GEN events
+class UpgradeWorkflow_GenHDF5(UpgradeWorkflow):
+    def setup_(self, step, stepName, stepDict, k, properties):
+        if 'GenSim' in step:
+            stepDict[stepName][k] = merge([{'-s': 'SIM', '--customise': 'GeneratorInterface/GenHDF5Interface/customise.simFromHDF5RelVal'}, stepDict[step][k]])
+        elif 'Digi' in step:
+            # keep the generator truth from the file: no genParticles rebuild from the SIM-level HepMC
+            stepDict[stepName][k] = merge([{'--customise': 'GeneratorInterface/GenHDF5Interface/customise.digiFromHDF5'}, stepDict[step][k]])
+    def condition(self, fragment, stepList, key, hasHarvest):
+        return fragment == 'TTbar_14TeV' and key == '2025'
+upgradeWFs['GenHDF5'] = UpgradeWorkflow_GenHDF5(
+    steps = [
+        'GenSim',
+        'Digi',
+    ],
+    PU = [],
+    suffix = '_FromHDF5',
+    offset = 0.86,
+)
+upgradeWFs['GenHDF5'].allowReuse = False
 
 class UpgradeWorkflow_SonicTriton(UpgradeWorkflow):
     def setup_(self, step, stepName, stepDict, k, properties):
