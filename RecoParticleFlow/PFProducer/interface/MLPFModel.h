@@ -175,6 +175,11 @@ namespace reco::mlpf {
 
   int argMax(std::vector<float> const& vec);
 
+  struct AdditionalTrackFilterParams {
+    std::unique_ptr<StringCutObjectSelector<reco::Track>> additionalFilterTk;
+    double ptError;
+  };
+
   // track link information to various calorimeter clusters
   struct TrackToCaloLinks {
     bool ecal;
@@ -184,21 +189,6 @@ namespace reco::mlpf {
 
     bool noCaloLink() const { return !ecal && !hcal && !hfEm && !hfHad; }
     bool noHadLink() const { return !hcal && !hfHad; }
-  };
-
-  inline const reco::PFBlock* findBlock(const reco::PFBlockCollection& blocks, const reco::PFBlockElement* elem) {
-    for (const auto& block : blocks)
-      if (std::any_of(block.elements().begin(), block.elements().end(), [&](const auto& e) { return &e == elem; }))
-        return &block;
-
-    return nullptr;
-  }
-
-  TrackToCaloLinks getTrackToCaloLinks(const reco::PFBlock* block, const reco::PFBlockElement* elem);
-
-  struct AdditionalTrackFilterParams {
-    std::unique_ptr<StringCutObjectSelector<reco::Track>> additionalFilterTk;
-    double ptError;
   };
 
   bool passAdditionalTrackFilterNoHCAL(const reco::PFBlockElement* elem,
@@ -254,6 +244,16 @@ namespace reco::mlpf {
   void setCandidateRefs(reco::PFCandidate& cand,
                         const std::vector<const reco::PFBlockElement*> elems,
                         size_t ielem_originator);
+
+  inline const reco::PFBlock* findBlock(const reco::PFBlockCollection& blocks, const reco::PFBlockElement* elem) {
+    for (const auto& block : blocks)
+      if (std::any_of(block.elements().begin(), block.elements().end(), [&](const auto& e) { return &e == elem; }))
+        return &block;
+
+    return nullptr;
+  }
+
+  TrackToCaloLinks getTrackToCaloLinks(const reco::PFBlock* block, const reco::PFBlockElement* elem);
 
 };  // namespace reco::mlpf
 
