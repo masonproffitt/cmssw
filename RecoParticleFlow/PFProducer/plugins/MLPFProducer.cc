@@ -131,7 +131,16 @@ void MLPFProducer::produce(edm::Event& event, const edm::EventSetup& setup) {
   assert(output_p4.size() == tensor_size * NUM_OUTPUT_FEATURES_P4);
 #endif
 
-  auto candidates = makeCandidates(inputs, output_binary, output_pid, output_p4, blocks, additionalTrackFilterNoHCAL_, additionalTrackFilterParams_, noRegressionEndcap_, endcapTk_, selected_elements);
+  auto candidates = makeCandidates(inputs,
+                                   output_binary,
+                                   output_pid,
+                                   output_p4,
+                                   blocks,
+                                   additionalTrackFilterNoHCAL_,
+                                   additionalTrackFilterParams_,
+                                   noRegressionEndcap_,
+                                   endcapTk_,
+                                   selected_elements);
   event.emplace(pfCandidatesPutToken_, candidates);
 }
 

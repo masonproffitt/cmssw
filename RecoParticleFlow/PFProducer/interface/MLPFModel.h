@@ -201,7 +201,9 @@ namespace reco::mlpf {
     double ptError;
   };
 
-  bool passAdditionalTrackFilterNoHCAL(const reco::PFBlockElement* elem, const AdditionalTrackFilterParams &params, const TrackToCaloLinks& links);
+  bool passAdditionalTrackFilterNoHCAL(const reco::PFBlockElement* elem,
+                                       const AdditionalTrackFilterParams& params,
+                                       const TrackToCaloLinks& links);
 
   reco::PFCandidate makeCandidate(int pred_pid,
                                   int pred_charge,
@@ -223,27 +225,29 @@ namespace reco::mlpf {
                                                 const StringCutObjectSelector<reco::Track>& endcapTk,
                                                 const std::vector<const reco::PFBlockElement*> selected_elements);
 
-  extern template std::vector<reco::PFCandidate> makeCandidates(const std::vector<std::vector<float>>& inputs,
-                                                                const std::vector<float>& output_binary,
-                                                                const std::vector<float>& output_pid,
-                                                                const std::vector<float>& output_p4,
-                                                                const reco::PFBlockCollection& blocks,
-                                                                const bool additionalTrackFilterNoHCAL,
-                                                                const AdditionalTrackFilterParams& additionalTrackFilterParams,
-                                                                const bool noRegressionEndcap,
-                                                                const StringCutObjectSelector<reco::Track>& endcapTk,
-                                                                const std::vector<const reco::PFBlockElement*> selected_elements);
+  extern template std::vector<reco::PFCandidate> makeCandidates(
+      const std::vector<std::vector<float>>& inputs,
+      const std::vector<float>& output_binary,
+      const std::vector<float>& output_pid,
+      const std::vector<float>& output_p4,
+      const reco::PFBlockCollection& blocks,
+      const bool additionalTrackFilterNoHCAL,
+      const AdditionalTrackFilterParams& additionalTrackFilterParams,
+      const bool noRegressionEndcap,
+      const StringCutObjectSelector<reco::Track>& endcapTk,
+      const std::vector<const reco::PFBlockElement*> selected_elements);
 
-  extern template std::vector<reco::PFCandidate> makeCandidates(const std::vector<std::vector<float>>& inputs,
-                                                                const std::span<const float>& output_binary,
-                                                                const std::span<const float>& output_pid,
-                                                                const std::span<const float>& output_p4,
-                                                                const reco::PFBlockCollection& blocks,
-                                                                const bool additionalTrackFilterNoHCAL,
-                                                                const AdditionalTrackFilterParams& additionalTrackFilterParams,
-                                                                const bool noRegressionEndcap,
-                                                                const StringCutObjectSelector<reco::Track>& endcapTk,
-                                                                const std::vector<const reco::PFBlockElement*> selected_elements);
+  extern template std::vector<reco::PFCandidate> makeCandidates(
+      const std::vector<std::vector<float>>& inputs,
+      const std::span<const float>& output_binary,
+      const std::span<const float>& output_pid,
+      const std::span<const float>& output_p4,
+      const reco::PFBlockCollection& blocks,
+      const bool additionalTrackFilterNoHCAL,
+      const AdditionalTrackFilterParams& additionalTrackFilterParams,
+      const bool noRegressionEndcap,
+      const StringCutObjectSelector<reco::Track>& endcapTk,
+      const std::vector<const reco::PFBlockElement*> selected_elements);
 
   const std::vector<const reco::PFBlockElement*> getPFElements(const reco::PFBlockCollection& blocks);
 

@@ -57,7 +57,6 @@ MLPFSONICProducer::MLPFSONICProducer(const edm::ParameterSet &iConfig)
       input_names_(iConfig.getParameter<std::vector<std::string>>("input_names")),
       output_names_(iConfig.getParameter<std::vector<std::string>>("output_names")) {}
 
-
 MLPFSONICProducer::~MLPFSONICProducer() {}
 void MLPFSONICProducer::acquire(edm::Event const &iEvent, edm::EventSetup const &iSetup, Input &iInput) {
   using namespace reco::mlpf;
@@ -129,7 +128,16 @@ void MLPFSONICProducer::produce(edm::Event &iEvent, const edm::EventSetup &iSetu
   const auto &output_binary = output1.fromServer<float>();
   const auto &output_pid = output2.fromServer<float>();
   const auto &output_p4 = output3.fromServer<float>();
-  auto candidates = makeCandidates(inputs, output_binary[0], output_pid[0], output_p4[0], blocks, additionalTrackFilterNoHCAL_, additionalTrackFilterParams_, noRegressionEndcap_, endcapTk_, selected_elements_);
+  auto candidates = makeCandidates(inputs,
+                                   output_binary[0],
+                                   output_pid[0],
+                                   output_p4[0],
+                                   blocks,
+                                   additionalTrackFilterNoHCAL_,
+                                   additionalTrackFilterParams_,
+                                   noRegressionEndcap_,
+                                   endcapTk_,
+                                   selected_elements_);
   iEvent.emplace(pfCandidatesPutToken_, candidates);
 }
 
